@@ -1,29 +1,25 @@
-#
+<#
 .SYNOPSIS
-    Scans for installed Steam games and adds them to Apollo/Sunshine apps.json with cover art from SteamGridDB.
+    Scans for installed Steam games and adds them to Apollo/Sunshine apps.json, using local Steam cover art.
 
 .DESCRIPTION
     This script finds the Steam installation path, locates all library folders, scans for installed games,
-    fetches cover art from SteamGridDB (requires API Key), and updates the Apollo/Sunshine configuration file.
-
-.PARAMETER SteamGridDBApiKey
-    Your personal API Key from SteamGridDB (https://www.steamgriddb.com/profile/preferences/api).
-    Required for cover art downloading.
+    copies existing cover art from Steam's local library cache, and updates the Apollo/Sunshine configuration file.
 
 .PARAMETER ApolloConfigPath
     Path to the apps.json file. Defaults to "C:\Program Files\Apollo\config\apps.json".
 
 .PARAMETER CoverArtPath
-    Directory to save downloaded cover art. Defaults to "C:\Program Files\Apollo\covers".
+    Directory to save copied cover art. Defaults to "C:\Program Files\Apollo\covers".
+
+.PARAMETER ForceUpdate
+    If specified, updates existing games and refreshes their cover art.
 
 .EXAMPLE
-    .\Get-SteamGamesForApollo.ps1 -SteamGridDBApiKey "YOUR_API_KEY"
+    .\Get-SteamGamesForApollo.ps1
 #>
 
 param(
-    [Parameter(Mandatory=$false)]
-    [string]$SteamGridDBApiKey,
-
     [string]$ApolloConfigPath = "C:\Program Files\Apollo\config\apps.json",
 
     [string]$CoverArtPath = "C:\Program Files\Apollo\covers",
@@ -128,43 +124,6 @@ function Get-SteamAppInfo {
     return $null
 }
 
-# Function to get cover art URL from SteamGridDB using Steam AppID directly
-function Get-SteamGridDBCover {
-    param($AppId)
-
-    if (-not $SteamGridDBApiKey -or -not $AppId) { return $null }
-
-    $headers = @{ "Authorization" = "Bearer $SteamGridDBApiKey" }
-
-    # Try 1: Prefer vertical grids (600x900) looked up by Steam AppID
-    $url = "https://www.steamgriddb.com/api/v2/grids/steam/$($AppId)?dimensions=600x900&styles=alternate,official,white_logo,material"
-
-    try {
-        $response = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction Stop
-        if ($response.success -and $response.data.Count -gt 0) {
-            return $response.data[0].url
-        }
-    }
-    catch {
-        Write-Verbose "  Specific dimension search failed for Steam AppID $AppId. Trying fallback..."
-    }
-
-    # Try 2: Fallback to ANY grid for this Steam AppID
-    $fallbackUrl = "https://www.steamgriddb.com/api/v2/grids/steam/$($AppId)?styles=alternate,official,white_logo,material"
-
-    try {
-        $response = Invoke-RestMethod -Uri $fallbackUrl -Headers $headers -Method Get -ErrorAction Stop
-        if ($response.success -and $response.data.Count -gt 0) {
-            return $response.data[0].url
-        }
-    }
-    catch {
-        Write-Warning "  Failed to get cover for Steam AppID '$AppId': $($_.Exception.Message)"
-    }
-
-    return $null
-}
-
 # Main Script Logic
 Write-Host "Checking for Administrator privileges..."
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -179,6 +138,16 @@ if (-not $steamPath) {
 }
 
 Write-Host "Found Steam at: $steamPath"
+
+# Define local library cache path.
+# Steam stores cover art flat in this folder as: {AppID}_library_600x900.jpg, {AppID}_header.jpg, etc.
+# There are NO per-AppID subdirectories.
+$libraryCachePath = Join-Path $steamPath "appcache\librarycache"
+if (-not (Test-Path $libraryCachePath)) {
+    Write-Warning "Steam library cache not found at '$libraryCachePath'. Cover art may not be available."
+} else {
+    Write-Host "Steam library cache found at: $libraryCachePath"
+}
 
 $libraryFolders = Get-SteamLibraryFolders -SteamPath $steamPath
 Write-Host "Found $($libraryFolders.Count) library folder(s)."
@@ -250,34 +219,47 @@ foreach ($game in $installedGames) {
 
         $imagePath = ""
 
-        # SteamGridDB Integration — look up directly by Steam AppID (no search step needed)
-        if ($SteamGridDBApiKey) {
-            Write-Host "  Fetching cover art from SteamGridDB..."
-            $imageUrl = Get-SteamGridDBCover -AppId $game.AppId
+        # Local Steam Asset Search
+        # Files live flat in librarycache\ named {AppID}_library_600x900.jpg, etc.
+        $localCoverSource = $null
 
-            if ($imageUrl) {
-                $fileName = "$($game.AppId).png"
-                $localImagePath = Join-Path $CoverArtPath $fileName
+        if (Test-Path $libraryCachePath) {
+            # Priority 1: Vertical Library Cover (600x900) — best for Apollo
+            $localCoverSource = Get-ChildItem -Path $libraryCachePath -Filter "$($game.AppId)_library_600x900*.jpg" -File -ErrorAction SilentlyContinue | Select-Object -First 1
 
-                try {
-                    Invoke-WebRequest -Uri $imageUrl -OutFile $localImagePath
-                    $imagePath = $localImagePath
-                    Write-Host "  Downloaded cover art to: $imagePath"
-                }
-                catch {
-                    Write-Warning "  Failed to download cover art."
-                }
-            } else {
-                Write-Host "  No cover art found on SteamGridDB."
+            # Priority 2: Legacy capsule cover
+            if (-not $localCoverSource) {
+                $localCoverSource = Get-ChildItem -Path $libraryCachePath -Filter "$($game.AppId)_library_capsule*.jpg" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            }
+
+            # Priority 3: Header image fallback (horizontal, but better than nothing)
+            if (-not $localCoverSource) {
+                $localCoverSource = Get-ChildItem -Path $libraryCachePath -Filter "$($game.AppId)_header.jpg" -File -ErrorAction SilentlyContinue | Select-Object -First 1
             }
         }
 
+        if ($localCoverSource) {
+            $fileName = "$($game.AppId)$($localCoverSource.Extension)"
+            $destPath = Join-Path $CoverArtPath $fileName
+
+            try {
+                Copy-Item -Path $localCoverSource.FullName -Destination $destPath -Force
+                $imagePath = $destPath
+                Write-Host "  Copied local cover art: $fileName (from $($localCoverSource.Name))"
+            }
+            catch {
+                Write-Warning "  Failed to copy cover art for $($game.Name)."
+            }
+        } else {
+            Write-Host "  No local cover art found in Steam cache for $($game.Name)."
+        }
+
         $newApp = [ordered]@{
-            name             = $game.Name
-            output           = ""
-            cmd              = ""
-            detached         = @("steam://rungameid/$($game.AppId)")
-            "image-path"     = $imagePath
+            name              = $game.Name
+            output            = ""
+            cmd               = ""
+            detached          = @("steam://rungameid/$($game.AppId)")
+            "image-path"      = $imagePath
             "virtual-display" = $true
         }
 
